@@ -1,3 +1,12 @@
+This code is an addition to the original VaST repository.
+Two types of Normalizing Flows were added to the latent space probability distributions.
+
+Code done by: Oliver Aastrand and Rafael Moraes
+
+-----------------
+
+### Below are the original instructions on how to install and run this code, written by the original VaST authors:
+-------------
 # Variational State Tabulation
 
 An implementation of Variational State Tabulation, using Python, TensorFlow and Cython. Based on the paper here: https://arxiv.org/abs/1802.04325.
