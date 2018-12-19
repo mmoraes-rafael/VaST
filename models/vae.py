@@ -10,7 +10,10 @@ import threading
 import time
 from ops import *
 from base import BaseModel
+
 cross_ent = tf.nn.sigmoid_cross_entropy_with_logits
+
+eps = 1e-5
 
 class FilteringVAE(BaseModel):
 
@@ -38,12 +41,21 @@ class FilteringVAE(BaseModel):
 		# Use recognition network to determine probabilities in latent space
 		self.logit_z = self.encoder_network(self.input_obs, 
 		                               		self.n_z*self.n_dim)
-		with tf.variable_scope('z_prob'):
-			self.z_prob = self._softmax(self.logit_z)
-		with tf.variable_scope('z_entropy'):
-			self.z_entropy = -tf.reduce_sum(self.z_prob*tf.log(self.z_prob+1e-15), 1)
-			variable_summaries(self.z_entropy)
+
+		######
+		# Invert order of computing z_prob to include NF and sampled variables
+		#####
 		self.z = self._sample_z(self.logit_z)
+		self.z_after_flows = tf.reshape(self.z, [-1, self.n_z * self.n_dim])
+
+		with tf.variable_scope('z_prob'):
+			#self.z_prob = self._softmax(self.logit_z)
+			self.z_prob = self.z_after_flows
+		with tf.variable_scope('z_entropy'):
+			#self.z_entropy = -tf.reduce_sum(self.z_prob*tf.log(self.z_prob+1e-15), 1)
+			self.z_entropy = -tf.reduce_sum(self.z_after_flows * tf.log(self.z_after_flows + 1e-15), 1)
+			variable_summaries(self.z_entropy)
+
 		# Recover reconstruction of input from sampled z
 		recon_zs = self.z[:self.minibatch_size]
 		self.raw_obs_reconstr = self._decoder_network(recon_zs, self.net_arch)
@@ -72,6 +84,159 @@ class FilteringVAE(BaseModel):
 		self.input_obs = tf.to_float(self.obs)/255.
 		self.target_obs = (tf.to_float(post_obs[:self.minibatch_size, :, :, :self.obs_channels])/255.)
 
+	def normFlow_1PF(self, z_0):
+		log_abs_det_jacobian = 0
+
+		self.u1 = tf.Variable(tf.random_normal(shape=[self.n_z], mean=0.0, stddev=1.0))
+		self.w1 = tf.get_variable("w1", shape=[self.n_z, self.n_z], initializer=tf.contrib.layers.xavier_initializer())
+		self.b1 = tf.get_variable("b1", shape=[self.n_z], initializer=tf.constant_initializer(0.1))
+
+		wt_z0 = tf.matmul(z_0, self.w1)
+		wt_z0 = tf.clip_by_value(wt_z0, -5, 5)
+
+		self.uhat1 = tf.expand_dims(self.u1, 0) + tf.matmul( (-1 + tf.log(1 + tf.exp(wt_z0) ) - wt_z0) ,  self.w1 / (tf.reduce_sum(tf.square(self.w1))) )
+
+		self.transf1 = wt_z0 + tf.expand_dims(self.b1, 0)
+		#self.transf1 = tf.clip_by_value(self.transf1, -5, 5)
+		self.z_1 = tf.add(z_0, tf.multiply(self.uhat1, tf.sigmoid(self.transf1)))
+
+		h_prime1 = tf.exp(self.transf1) / tf.pow(1 + tf.exp(self.transf1), 2) 
+		log_abs_det_jacobian += tf.log(tf.abs(1 + tf.matmul(tf.matmul(h_prime1, self.w1), tf.expand_dims(self.u1, 1) ) ) + eps)
+
+		return self.z_1, log_abs_det_jacobian
+
+	def normFlow_4PF(self, z_0):
+		log_abs_det_jacobian = 0
+
+		#### Flow 1
+		self.u1 = tf.Variable(tf.random_normal(shape=[self.n_z], mean=0.0, stddev=1.0))
+		self.w1 = tf.get_variable("w1", shape=[self.n_z, self.n_z], initializer=tf.contrib.layers.xavier_initializer())
+		self.b1 = tf.get_variable("b1", shape=[self.n_z], initializer=tf.constant_initializer(0.1))
+
+		wt_z0 = tf.matmul(z_0, self.w1)
+		wt_z0 = tf.clip_by_value(wt_z0, -5, 5)
+
+		self.uhat1 = tf.expand_dims(self.u1, 0) + tf.matmul( (-1 + tf.log(1 + tf.exp(wt_z0) ) - wt_z0) ,  self.w1 / (tf.reduce_sum(tf.square(self.w1))) )
+
+		self.transf1 = wt_z0 + tf.expand_dims(self.b1, 0)
+		#self.transf1 = tf.clip_by_value(self.transf1, -5, 5)
+		self.z_1 = tf.add(z_0, tf.multiply(self.uhat1, tf.sigmoid(self.transf1)))
+
+		h_prime1 = tf.exp(self.transf1) / tf.pow(1 + tf.exp(self.transf1), 2) 
+		log_abs_det_jacobian += tf.log(tf.abs(1 + tf.matmul(tf.matmul(h_prime1, self.w1), tf.expand_dims(self.u1, 1) ) ) + eps)
+
+		#### Flow 2
+		self.u2 = tf.Variable(tf.random_normal(shape=[self.n_z], mean=0.0, stddev=1.0))
+		self.w2 = tf.get_variable("w2", shape=[self.n_z, self.n_z], initializer=tf.contrib.layers.xavier_initializer())
+		self.b2 = tf.get_variable("b2", shape=[self.n_z], initializer=tf.constant_initializer(0.1))
+
+		wt_z1 = tf.matmul(self.z_1, self.w2)
+		wt_z1 = tf.clip_by_value(wt_z1, -5, 5)
+
+		self.uhat2 = tf.expand_dims(self.u2, 0) + tf.matmul( (-1 + tf.log(1 + tf.exp(wt_z1) ) - wt_z1) ,  self.w2 / (tf.reduce_sum(tf.square(self.w2))) )
+
+		self.transf2 = wt_z1 + tf.expand_dims(self.b2, 0)
+		#self.transf1 = tf.clip_by_value(self.transf1, -5, 5)
+		self.z_2 = tf.add(self.z_1, tf.multiply(self.uhat2, tf.sigmoid(self.transf2)))
+
+		h_prime2 = tf.exp(self.transf2) / tf.pow(1 + tf.exp(self.transf2), 2) 
+		log_abs_det_jacobian += tf.log(tf.abs(1 + tf.matmul(tf.matmul(h_prime2, self.w2), tf.expand_dims(self.u2, 1) ) ) + eps)
+
+		#### Flow 3
+		self.u3 = tf.Variable(tf.random_normal(shape=[self.n_z], mean=0.0, stddev=1.0))
+		self.w3 = tf.get_variable("w3", shape=[self.n_z, self.n_z], initializer=tf.contrib.layers.xavier_initializer())
+		self.b3 = tf.get_variable("b3", shape=[self.n_z], initializer=tf.constant_initializer(0.1))
+
+		wt_z2 = tf.matmul(self.z_2, self.w3)
+		wt_z2 = tf.clip_by_value(wt_z2, -5, 5)
+
+		self.uhat3 = tf.expand_dims(self.u3, 0) + tf.matmul( (-1 + tf.log(1 + tf.exp(wt_z2) ) - wt_z2) ,  self.w3 / (tf.reduce_sum(tf.square(self.w3))) )
+
+		self.transf3 = wt_z2 + tf.expand_dims(self.b3, 0)
+		#self.transf1 = tf.clip_by_value(self.transf1, -5, 5)
+		self.z_3 = tf.add(self.z_2, tf.multiply(self.uhat3, tf.sigmoid(self.transf3)))
+
+		h_prime3 = tf.exp(self.transf3) / tf.pow(1 + tf.exp(self.transf3), 2) 
+		log_abs_det_jacobian += tf.log(tf.abs(1 + tf.matmul(tf.matmul(h_prime3, self.w3), tf.expand_dims(self.u3, 1) ) ) + eps)
+
+		#### Flow 4
+		self.u4 = tf.Variable(tf.random_normal(shape=[self.n_z], mean=0.0, stddev=1.0))
+		self.w4 = tf.get_variable("w4", shape=[self.n_z, self.n_z], initializer=tf.contrib.layers.xavier_initializer())
+		self.b4 = tf.get_variable("b4", shape=[self.n_z], initializer=tf.constant_initializer(0.1))
+
+		wt_z3 = tf.matmul(self.z_3, self.w4)
+		wt_z3 = tf.clip_by_value(wt_z3, -5, 5)
+
+		self.uhat4 = tf.expand_dims(self.u4, 0) + tf.matmul( (-1 + tf.log(1 + tf.exp(wt_z3) ) - wt_z3) ,  self.w4 / (tf.reduce_sum(tf.square(self.w4))) )
+
+		self.transf4 = wt_z3 + tf.expand_dims(self.b4, 0)
+		#self.transf1 = tf.clip_by_value(self.transf1, -5, 5)
+		self.z_4 = tf.add(self.z_3, tf.multiply(self.uhat4, tf.sigmoid(self.transf4)))
+
+		h_prime4 = tf.exp(self.transf4) / tf.pow(1 + tf.exp(self.transf4), 2) 
+		log_abs_det_jacobian += tf.log(tf.abs(1 + tf.matmul(tf.matmul(h_prime4, self.w4), tf.expand_dims(self.u4, 1) ) ) + eps)
+
+
+		return self.z_4, log_abs_det_jacobian
+
+
+	def RNVP_layer(self, z_in, D, d, layer_nr):
+		# We need to alternate between which part is transformed
+		# and which part is preserved
+		if layer_nr % 2 == 0:
+			z_pres = z_in[:, :d]
+			z_trans_pre = z_in[:, d:]
+
+			trans_dim = D - d
+			pres_dim = d
+
+		else:
+			z_pres = z_in[:, d:]
+			z_trans_pre = z_in[:, :d]
+
+			trans_dim = d
+			pres_dim = D - d
+
+		# Weights for the s transform
+		ws = tf.get_variable("ws{}".format(layer_nr), shape=[pres_dim, trans_dim], initializer=tf.contrib.layers.xavier_initializer())
+		bs = tf.get_variable("bs{}".format(layer_nr), shape=[trans_dim], initializer=tf.constant_initializer(0.1))
+
+		# Weights for the t transform
+		wt = tf.get_variable("wt{}".format(layer_nr), shape=[pres_dim, trans_dim], initializer=tf.contrib.layers.xavier_initializer())
+		bt = tf.get_variable("bt{}".format(layer_nr), shape=[trans_dim], initializer=tf.constant_initializer(0.1))
+
+		# S uses tanh to avoid overflow in the exponential
+		# see second to last paragraph page 7 RNVP paper
+		s = tf.nn.tanh(tf.matmul(z_pres, ws) + bs)
+		t = tf.nn.relu(tf.matmul(z_pres, wt) + bt)
+
+		z_trans_post = tf.multiply(z_trans_pre, tf.exp(s)) + t
+
+		# Concatenat the preserved and transformed values
+		z_out = tf.concat([z_pres, z_trans_post], 1)
+
+		log_abs_det_jacobian = tf.reduce_sum(s)
+
+		return z_out, log_abs_det_jacobian
+
+
+	def normFlow_RNVP(self, z_0):
+		log_abs_det_jacobian = 0
+
+		# Transform half of the variables at a time
+		D = self.n_z
+		d = int(D / 2)
+
+		nr_layers = 4
+
+		z_1 = z_0
+		for i in range(nr_layers):
+			z_1, cost = self.RNVP_layer(z_1, D, d, i)
+			log_abs_det_jacobian += cost
+
+		return z_1, log_abs_det_jacobian
+
+
 	def _sample_z(self, logit_z):
 		# Draw one sample z from Gumbel-Softmax distribution
 		with tf.name_scope('z_sample'):
@@ -79,7 +244,23 @@ class FilteringVAE(BaseModel):
 			all_vars = tf.reshape(self.logit_z, [-1, self.n_dim])
 			self.log_alphas = tf.reshape(all_vars[:, 0] - all_vars[:, 1], [-1, self.n_z])
 			self.y = (self.log_alphas + sample_logistic(tf.shape(self.log_alphas)))/self.tau
-			zs = tf.nn.sigmoid(self.y)
+
+			#####
+			## Apply Normalizing Flow on top of the logistic
+			#####
+			self.log_abs_det_jacobian = 0
+
+			#self.z_1, log_det_jac  = self.normFlow_1PF(self.y)
+			self.z_k, log_det_jac  = self.normFlow_4PF(self.y)
+			#self.z_k, log_det_jac  = self.normFlow_RNVP(self.y)
+			
+			self.log_abs_det_jacobian += log_det_jac
+
+			self.log_abs_det_jacobian = tf.clip_by_value(self.log_abs_det_jacobian, -100, 100)
+
+			#zs = tf.nn.sigmoid(self.y)
+			zs = tf.nn.sigmoid(self.z_k)
+
 			z = tf.reshape(tf.stack([zs, 1-zs],2), [-1, self.n_z*self.n_dim])
 		return z
 
@@ -177,7 +358,7 @@ class FilteringVAE(BaseModel):
 		log_prior_density = tf.reduce_sum(self._log_logistic_density(output_y, 
 		                                                             self.prior_tau,
 		                                                             self.log_priors), 1)
-		prior_cost = tf.reduce_mean(log_y_density - log_prior_density)
+		prior_cost = tf.reduce_mean(log_y_density - log_prior_density) - tf.reduce_mean(self.log_abs_det_jacobian)
 		tf.summary.scalar('prior_cost', prior_cost)
 		reward_cost = 0
 		if self.beta_reward>0:
